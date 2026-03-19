@@ -5,17 +5,41 @@ import chromadb
 from chromadb.config import Settings
 from tqdm import tqdm
 from typing import List, Dict, Optional
+from rank_bm25 import BM25Okapi
+from nltk.tokenize import word_tokenize
+import nltk
+from core.text_processor import process_book # type: ignore
+from core.llm_client import expand_query # type: ignore
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
 
+
+# Глобальные переменные для BM25
+_bm25_index = None
+_bm25_chunks = []   # список словарей с полными данными 
 # Константы
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Лёгкая и быстрая модель
 CHROMA_PERSIST_DIR = "./chroma_data"   # Папка для хранения базы данных
 COLLECTION_NAME = "books"               # Имя коллекции
-MIN_SCORE = 0.3
-# Глобальные объекты (чтобы не перезагружать модель и клиент при каждом вызове)
+MIN_SCORE = 0.33
+# Глобальные объекты
 _model = None
 _chroma_client = None
 _collection = None
 
+def build_bm25_index(chunks: List[Dict]):
+    """
+    Строит BM25 индекс по списку чанков.
+    chunks - список словарей с ключами book_id, chunk_index, text
+    """
+    global _bm25_index, _bm25_chunks
+    _bm25_chunks = chunks
+    # Токенизируем текст каждого чанка
+    tokenized_corpus = [word_tokenize(chunk['text'], language='russian') for chunk in chunks]
+    _bm25_index = BM25Okapi(tokenized_corpus)
+    print(f"BM25 индекс построен. Всего чанков: {len(chunks)}")
 
 def get_embedding_model():
     """Ленивая загрузка модели эмбеддингов."""
@@ -30,11 +54,9 @@ def get_chroma_collection():
     """Ленивая инициализация клиента ChromaDB и получение коллекции."""
     global _chroma_client, _collection
     if _chroma_client is None:
-        # Убеждаемся, что папка для данных существует
         os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
         _chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
     if _collection is None:
-        # Получаем или создаём коллекцию
         _collection = _chroma_client.get_or_create_collection(
             name=COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"}  # используем косинусную метрику
@@ -43,26 +65,23 @@ def get_chroma_collection():
 
 
 def add_chunks(chunks: List[Dict]):
-    """
-    Добавляет список чанков в векторную базу.
-    Каждый чанк — словарь с ключами: book_id, chapter, chunk_index, text
-    """
+    """Добавляет список чанков в векторную базу."""
     if not chunks:
         return
 
     model = get_embedding_model()
     collection = get_chroma_collection()
 
-    # Подготавливаем данные для пакетной вставки
+    # Подготавливаем данные
     ids = []
     embeddings = []
     metadatas = []
     documents = []
 
-    # Собираем тексты для эмбеддингов
+    # Собираем тексты
     texts = [chunk['text'] for chunk in chunks]
 
-    # Генерируем эмбеддинги пачкой (быстрее, чем по одному)
+    # Генерируем эмбеддинги пачкой
     print("Генерация эмбеддингов...")
     embeddings_list = model.encode(texts, show_progress_bar=True).tolist()
 
@@ -73,7 +92,6 @@ def add_chunks(chunks: List[Dict]):
         embeddings.append(embeddings_list[idx])
         metadatas.append({
             "book_id": chunk['book_id'],
-            "chapter": chunk['chapter'],
             "chunk_index": chunk['chunk_index']
         })
         documents.append(chunk['text'])
@@ -86,17 +104,13 @@ def add_chunks(chunks: List[Dict]):
         documents=documents
     )
     print(f"Добавлено {len(chunks)} чанков в коллекцию.")
+    all_chunks = get_all_chunks()
+    build_bm25_index(all_chunks)
 
 
 def search(query: str, n_results: int = 5) -> List[Dict]:
-    """
-    Ищет n_results наиболее похожих чанков на запрос.
-    Возвращает список словарей с ключами:
-        book_id, chapter, chunk_index, text, score
-    """
     if not query.strip():
         return []
-
     model = get_embedding_model()
     collection = get_chroma_collection()
 
@@ -114,20 +128,26 @@ def search(query: str, n_results: int = 5) -> List[Dict]:
     output = []
     if results['ids'] and results['ids'][0]:
         for i in range(len(results['ids'][0])):
-            # distance — косинусное расстояние (от 0 до 2). Преобразуем в сходство.
             distance = results['distances'][0][i]
-            score = 1 - distance  # чем ближе к 1, тем лучше
-            if score > MIN_SCORE:
-                output.append({
+            score = 1 - distance
+            output.append({
                     'book_id': results['metadatas'][0][i]['book_id'],
-                    'chapter': results['metadatas'][0][i]['chapter'],
                     'chunk_index': results['metadatas'][0][i]['chunk_index'],
                     'text': results['documents'][0][i],
                     'score': score
                 })
-            else:
-                break
     return output
+
+def get_all_books() -> list[str]:
+    """Возвращает списоr книг, присутствующих в векторной базе."""
+    collection = get_chroma_collection()
+    # Получаем метаданные всех чанков
+    all_data = collection.get(include=["metadatas"])
+    if not all_data['metadatas']:
+        return []
+    # Извлекаем book_id и оставляем только уникальные
+    book_ids = set(meta['book_id'] for meta in all_data['metadatas'])
+    return sorted(book_ids)
 
 def delete_book(book_id: str):
     """Удаляет все чанки, принадлежащие книге с указанным book_id."""
@@ -146,3 +166,134 @@ def reset_collection():
         print(f"Коллекция {COLLECTION_NAME} удалена.")
     except ValueError:
         print("Коллекция не существовала.")
+
+def get_all_chunks() -> List[Dict]:
+    """Извлекает все чанки из векторной базы и возвращает в виде списка словарей."""
+    collection = get_chroma_collection()
+    # Получаем все записи
+    all_data = collection.get(include=["documents", "metadatas"])
+    chunks = []
+    for i in range(len(all_data['ids'])):
+        chunks.append({
+            'book_id': all_data['metadatas'][i]['book_id'],
+            'chunk_index': all_data['metadatas'][i]['chunk_index'],
+            'text': all_data['documents'][i]
+        })
+    return chunks
+
+
+
+def hybrid_search(query: str, n_results: int = 5, alpha: float = 0.5) -> List[Dict]:
+    """
+    Гибридный поиск: объединяет векторный поиск и BM25.
+    """
+
+    # 1. Векторный поиск
+    vector_results = search(query, n_results=n_results*2)
+
+    # 2. BM25 поиск 
+    bm25_results = []
+    if _bm25_index is not None and _bm25_chunks:
+        query_tokens = word_tokenize(query, language='russian')
+        scores = _bm25_index.get_scores(query_tokens)
+        # Сортируем
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:n_results*2]
+        max_score = scores.max()
+        if max_score == 0:
+            max_score = 1
+        for idx in top_indices:
+            chunk = _bm25_chunks[idx].copy()
+            chunk['score'] = scores[idx] / max_score
+            bm25_results.append(chunk)
+
+    # 3. Объединяем результаты
+    combined = {}
+    # Добавляем векторные результаты
+    for r in vector_results:
+        key = (r['book_id'], r['chunk_index'])
+        combined[key] = {'vector': r['score'], 'bm25': 0.0, 'data': r}
+    # Добавляем BM25 результаты
+    for r in bm25_results:
+        key = (r['book_id'], r['chunk_index'])
+        if key in combined:
+            combined[key]['bm25'] = r['score']
+        else:
+            combined[key] = {'vector': 0.0, 'bm25': r['score'], 'data': r}
+
+    # 4. Вычисляем гибридную оценку и сортируем
+    hybrid_list = []
+    for key, scores in combined.items():
+        hybrid_score = alpha * scores['vector'] + (1 - alpha) * scores['bm25']
+
+
+        if hybrid_score >= MIN_SCORE:
+            item = scores['data'].copy()
+            item['score'] = hybrid_score
+            hybrid_list.append(item)
+        else:
+            break
+    # Сортируем по убыванию гибридной оценки и берём топ-n results
+    hybrid_list.sort(key=lambda x: x['score'], reverse=True)
+    return hybrid_list[:n_results]
+
+
+def expanded_search(query: str, n_results: int = 5) -> List[Dict]:
+    """
+    Выполняет поиск с расширением запроса.
+    """
+    # Получаем варианты запросов
+    queries = expand_query(query, num_expansions=2)
+    print(f"Expanded queries: {queries}")  # отладка
+
+    # Собираем результаты для каждого запроса
+    all_results = []
+    for q in queries:
+        results = hybrid_search(q, n_results=n_results * 2)  # берём с запасом
+        all_results.extend(results)
+
+    # Убираем дубликаты по ID чанка (book_id + chunk_index)
+    unique = {}
+    for r in all_results:
+        key = f"{r['book_id']}_{r['chunk_index']}"
+        if key not in unique or r['score'] > unique[key]['score']:
+            unique[key] = r
+
+    # Сортируем по убыванию скоров
+    sorted_results = sorted(unique.values(), key=lambda x: x['score'], reverse=True)
+    return sorted_results[:n_results]
+
+def clear_database():
+    """Полностью очищает коллекцию книг в базе данных."""
+    collection = get_chroma_collection()
+    # Получаем все ID
+    all_data = collection.get(include=[]) 
+    ids = all_data.get('ids', [])
+    if ids:
+        collection.delete(ids=ids)
+        print(f"Удалено {len(ids)} записей из коллекции.")
+    else:
+        print("Коллекция уже пуста.")
+
+def load_standard_books():
+    """Загружает все книги из папки standard_books и индексирует их."""
+
+
+    std_dir = "standard_books"
+    if not os.path.exists(std_dir):
+        os.makedirs(std_dir)
+        print(f"Папка {std_dir} создана. Положите в неё книги.")
+        return
+
+    files = [f for f in os.listdir(std_dir) if f.endswith('.txt')]
+    if not files:
+        print("В папке standard_books нет .txt файлов.")
+        return
+
+    for filename in files:
+        filepath = os.path.join(std_dir, filename)
+        book_id = os.path.splitext(filename)[0]
+        print(f"Обработка {filename}...")
+        chunks = process_book(filepath, book_id)
+        if chunks:
+            add_chunks(chunks)  
+    print("Загрузка стандартных книг завершена.")
