@@ -8,7 +8,7 @@ from typing import List, Dict, Optional
 from rank_bm25 import BM25Okapi
 from nltk.tokenize import word_tokenize
 import nltk
-from core.text_processor import process_book # type: ignore
+from core.text_processor import process_book_with_parents, process_book # type: ignore
 from core.llm_client import expand_query # type: ignore
 try:
     nltk.data.find('tokenizers/punkt')
@@ -28,6 +28,7 @@ MIN_SCORE = 0.33
 _model = None
 _chroma_client = None
 _collection = None
+_parent_collection = None
 
 def build_bm25_index(chunks: List[Dict]):
     """
@@ -49,6 +50,13 @@ def get_embedding_model():
         _model = SentenceTransformer(EMBEDDING_MODEL)
     return _model
 
+def get_chroma_client():
+    """Возвращает клиент ChromaDB."""
+    global _chroma_client
+    if _chroma_client is None:
+        os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+        _chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    return _chroma_client
 
 def get_chroma_collection():
     """Ленивая инициализация клиента ChromaDB и получение коллекции."""
@@ -63,6 +71,121 @@ def get_chroma_collection():
         )
     return _collection
 
+def get_parent_collection():
+    """Получает или создаёт коллекцию для родительских документов."""
+    global _parent_collection
+    if _parent_collection is None:
+        client = get_chroma_client()
+        _parent_collection = client.get_or_create_collection(
+            name="parent_documents",
+            metadata={"hnsw:space": "cosine"}
+        )
+    return _parent_collection
+
+def add_book_with_parents(filepath: str, book_id: str):
+    """
+    Добавляет книгу в базу с иерархической структурой.
+    """
+    child_chunks, parent_docs = process_book_with_parents(filepath, book_id)
+    
+    # 1. Добавляем дочерние чанки (для поиска)
+    add_child_chunks(child_chunks)
+    
+    # 2. Добавляем родительские документы (для возврата)
+    add_parent_documents(parent_docs)
+    
+    print(f"Добавлена книга {book_id}: {len(child_chunks)} чанков, {len(parent_docs)} родителей")
+
+def add_child_chunks(chunks: List[Dict]):
+    """Добавляет дочерние чанки для поиска."""
+    model = get_embedding_model()
+    collection = get_chroma_collection()
+    
+    texts = [chunk['text'] for chunk in chunks]
+    embeddings = model.encode(texts, show_progress_bar=True).tolist()
+    
+    ids = []
+    metadatas = []
+    documents = []
+    
+    for idx, chunk in enumerate(chunks):
+        chunk_id = f"{chunk['book_id']}_child_{chunk['chunk_index']}"
+        ids.append(chunk_id)
+        metadatas.append({
+            'book_id': chunk['book_id'],
+            'parent_id': chunk['parent_id'],
+            'type': 'child'
+        })
+        documents.append(chunk['text'])
+    
+    collection.add(
+        ids=ids,
+        embeddings=embeddings,
+        metadatas=metadatas,
+        documents=documents
+    )
+
+def add_parent_documents(parents: List[Dict]):
+    """Добавляет родительские документы для возврата."""
+    model = get_embedding_model()
+    collection = get_parent_collection()
+    
+    texts = [p['text'] for p in parents]
+    embeddings = model.encode(texts, show_progress_bar=True).tolist()
+    
+    ids = [p['parent_id'] for p in parents]
+    metadatas = [{
+        'book_id': p['book_id'],
+        'chapter': p['chapter'],
+        'type': 'parent'
+    } for p in parents]
+    documents = [p['text'] for p in parents]
+    
+    collection.add(
+        ids=ids,
+        embeddings=embeddings,
+        metadatas=metadatas,
+        documents=documents
+    )
+
+def search_with_parents(query: str, n_results: int = 5) -> List[Dict]:
+    """
+    Поиск с возвратом родительских документов.
+    """
+    # 1. Ищем по дочерним чанкам
+    child_results = search(query, n_results=n_results * 2)  # берём с запасом
+
+    if not child_results:
+        return []
+
+    # 2. Собираем уникальные parent_id
+    parent_ids = set()
+    for r in child_results:
+        if 'parent_id' in r:
+            parent_ids.add(r['parent_id'])
+
+    if not parent_ids:
+        return []
+
+    # 3. Получаем родительские документы из коллекции
+    parent_collection = get_parent_collection()
+    parent_results = parent_collection.get(
+        ids=list(parent_ids),
+        include=["documents", "metadatas"]
+    )
+
+    # 4. Формируем результат
+    output = []
+    for i in range(len(parent_results['ids'])):
+        output.append({
+            'book_id': parent_results['metadatas'][i]['book_id'],
+            'chapter': parent_results['metadatas'][i]['chapter'],
+            'parent_id': parent_results['ids'][i],
+            'text': parent_results['documents'][i],
+            'score': 1.0  # Можно рассчитать среднюю оценку от дочерних
+        })
+
+    return output[:n_results]
 
 def add_chunks(chunks: List[Dict]):
     """Добавляет список чанков в векторную базу."""
@@ -114,28 +237,29 @@ def search(query: str, n_results: int = 5) -> List[Dict]:
     model = get_embedding_model()
     collection = get_chroma_collection()
 
-    # Преобразуем запрос в вектор
     query_emb = model.encode(query).tolist()
-
-    # Выполняем поиск
     results = collection.query(
         query_embeddings=[query_emb],
         n_results=n_results,
         include=["metadatas", "documents", "distances"]
     )
 
-    # Обрабатываем результаты
     output = []
     if results['ids'] and results['ids'][0]:
         for i in range(len(results['ids'][0])):
             distance = results['distances'][0][i]
             score = 1 - distance
-            output.append({
-                    'book_id': results['metadatas'][0][i]['book_id'],
-                    'chunk_index': results['metadatas'][0][i]['chunk_index'],
-                    'text': results['documents'][0][i],
-                    'score': score
-                })
+            meta = results['metadatas'][0][i]
+            item = {
+                'book_id': meta['book_id'],
+                'chunk_index': meta['chunk_index'],
+                'text': results['documents'][0][i],
+                'score': score
+            }
+            # Если есть parent_id, добавляем
+            if 'parent_id' in meta:
+                item['parent_id'] = meta['parent_id']
+            output.append(item)
     return output
 
 def get_all_books() -> list[str]:
@@ -187,7 +311,6 @@ def hybrid_search(query: str, n_results: int = 5, alpha: float = 0.5) -> List[Di
     """
     Гибридный поиск: объединяет векторный поиск и BM25.
     """
-
     # 1. Векторный поиск
     vector_results = search(query, n_results=n_results*2)
 
@@ -198,7 +321,7 @@ def hybrid_search(query: str, n_results: int = 5, alpha: float = 0.5) -> List[Di
         scores = _bm25_index.get_scores(query_tokens)
         # Сортируем
         top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:n_results*2]
-        max_score = scores.max()
+        max_score = max(scores) if scores else 1
         if max_score == 0:
             max_score = 1
         for idx in top_indices:
@@ -220,22 +343,17 @@ def hybrid_search(query: str, n_results: int = 5, alpha: float = 0.5) -> List[Di
         else:
             combined[key] = {'vector': 0.0, 'bm25': r['score'], 'data': r}
 
-    # 4. Вычисляем гибридную оценку и сортируем
     hybrid_list = []
     for key, scores in combined.items():
         hybrid_score = alpha * scores['vector'] + (1 - alpha) * scores['bm25']
-
-
         if hybrid_score >= MIN_SCORE:
             item = scores['data'].copy()
             item['score'] = hybrid_score
             hybrid_list.append(item)
-        else:
-            break
-    # Сортируем по убыванию гибридной оценки и берём топ-n results
+
+    # Сортируем по убыванию гибридной оценки и берём топ-n_results
     hybrid_list.sort(key=lambda x: x['score'], reverse=True)
     return hybrid_list[:n_results]
-
 
 def expanded_search(query: str, n_results: int = 5) -> List[Dict]:
     """
