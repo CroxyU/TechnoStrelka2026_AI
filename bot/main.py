@@ -50,30 +50,7 @@ def main():
 
 
     app.add_handler(conv_handler)
-    # Обработчик текстовых сообщений
-    async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Если пользователь написал текст, воспринимаем это как поисковый запрос
-        query = update.message.text
-        # Отправляем "печатает..."
-        await update.message.chat.send_action(action="typing")
-        # Выполняем поиск
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(None, expanded_search, query, 5)
-
-        if not results:
-            await update.message.reply_text("Ничего не найдено.")
-            return
-
-        response = f"Найдено {len(results)} фрагментов:\n\n"
-        for i, r in enumerate(results, 1):
-            response += f"**{i}. Книга:** {r['book_id']}\n"
-            response += f"**Фрагмент:**\n{r['text'][:300]}...\n"
-            response += f"**Релевантность:** {r['score']:.2f}\n\n"
-
-        await update.message.reply_text(response)
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_search))
-
+ 
     app.add_handler(CommandHandler("ask", ask_command))
 
     app.add_handler(CallbackQueryHandler(reset_confirmation_callback, pattern="^(confirm_reset|cancel_reset)$"))

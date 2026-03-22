@@ -1,7 +1,6 @@
 import os
 import re
 from typing import List, Dict, Optional
-
 import nltk
 
 # Скачиваем токенизатор для предложений (если не скачан)
@@ -100,8 +99,8 @@ def split_into_sentence_chunks(text: str, chunk_size: int = 350, overlap_sentenc
 
 
 def process_book_with_parents(filepath: str, book_id: str,
-                              parent_size: int = 2000,
-                              child_size: int = 500) -> tuple[list[dict], list[dict]]:
+                              parent_size: int = 1000,
+                              child_size: int = 100) -> tuple[list[dict], list[dict]]:
     """
     Обрабатывает книгу и создаёт иерархию:
     - Родительские документы (главы или большие блоки)

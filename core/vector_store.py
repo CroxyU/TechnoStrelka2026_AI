@@ -22,7 +22,7 @@ _bm25_chunks = []   # список словарей с полными данны
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Лёгкая и быстрая модель
 CHROMA_PERSIST_DIR = "./chroma_data"   # Папка для хранения базы данных
 COLLECTION_NAME = "books"               # Имя коллекции
-MIN_SCORE = 0.33
+MIN_SCORE = 0.1                     # Минимальный порог для включения в результаты поиска
 # Глобальные объекты
 _model = None
 _chroma_client = None
@@ -85,7 +85,7 @@ def add_book_with_parents(filepath: str, book_id: str):
     """
     Добавляет книгу в базу с иерархической структурой.
     """
-    child_chunks, parent_docs = process_book_with_parents(filepath, book_id)
+    child_chunks, parent_docs = process_book_with_parents(filepath, book_id, parent_size=1000, child_size=100)
     
     # 1. Добавляем дочерние чанки (для поиска)
     add_child_chunks(child_chunks)
@@ -402,6 +402,15 @@ def clear_database():
     else:
         print("Коллекция уже пуста.")
 
+def clear_parent_collection():
+    try:
+        client = get_chroma_client()
+        client.delete_collection("parent_documents")
+        global _parent_collection
+        _parent_collection = None
+        print("Коллекция parent_documents удалена.")
+    except Exception as e:
+        print(f"Коллекция не существовала или ошибка: {e}")
 
 def load_standard_books():
     std_dir = "standard_books"

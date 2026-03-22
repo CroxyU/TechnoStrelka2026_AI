@@ -1,14 +1,15 @@
 import os
+import html
 import asyncio
 from typing import List, Dict
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 from core.vector_store import ( # type: ignore
-    hybrid_search, get_all_books, delete_book, add_chunks,
-    add_book_with_parents, clear_database, load_standard_books,
-    expanded_search, search_with_parents, get_chroma_client
+    get_all_books, delete_book, add_book_with_parents, 
+    clear_database, load_standard_books, clear_parent_collection,
+    expanded_search, search_with_parents, hybrid_search
 )  
-from core.text_processor import process_book # type: ignore
+
 from core.llm_client import generate_answer  # type: ignore # в начало файла
 WAITING_FOR_BOOK = 1
 
@@ -63,7 +64,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(action="typing")
     
     # Используем поиск с родительскими документами
-    results = await loop.run_in_executor(None, search_with_parents, query, 5)
+    results = await loop.run_in_executor(None, expanded_search, query, 5)
     
     if not results:
         await update.message.reply_text("По вашему запросу ничего не найдено.")
@@ -94,7 +95,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    results = await loop.run_in_executor(None, expanded_search, question, 15)
+    results = await loop.run_in_executor(None, search_with_parents, question, 15)
 
     if not results:
         await update.message.reply_text("Я не нашёл в книгах информации, которая могла бы помочь ответить на этот вопрос.")
@@ -116,15 +117,18 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
 def format_search_results(results: List[Dict]) -> str:
-    if not results:
+    if not results or all(r['score'] < 0.3 for r in results):
         return "Ничего не найдено."
     lines = [f"🔍 <b>Найдено {len(results)} фрагментов:</b>\n"]
     for i, r in enumerate(results, 1):
+        if r['score'] < 0.3:
+            continue  # пропускаем нерелевантные результаты
         lines.append(
             f"<b>{i}. Книга:</b> {r['book_id']}\n"
             f"<b>Глава:</b> {r.get('chapter', '—')}\n"
-            f"<b>Фрагмент:</b>\n<blockquote>{r['text'][:500]}...</blockquote>\n"
+            f"<b>Фрагмент:</b>\n<blockquote>{html.escape(r['text'][:300])}...</blockquote>\n"
             f"<b>Релевантность:</b> {r['score']:.3f}\n"
         )
     return "\n".join(lines)
@@ -133,11 +137,11 @@ def format_answer_with_sources(answer: str, results: List[Dict]) -> str:
     """Форматирует ответ LLM вместе с исходными цитатами."""
     lines = [f"🤖 <b>Ответ:</b>\n{answer}\n"]
     lines.append("\n📚 <b>Источники:</b>")
-    for i, r in enumerate(results, 1):
+    for i, r in enumerate(results[:5], 1):
         lines.append(
             f"<b>{i}. Книга:</b> {r['book_id']}\n"
             f"<b>Глава:</b> {r.get('chapter', '—')}\n"
-            f"<b>Фрагмент:</b>\n<blockquote>{r['text'][:500]}...</blockquote>\n"
+            f"<b>Фрагмент:</b>\n<blockquote>{html.escape(r['text'][:300])}...</blockquote>\n"
             f"<b>Релевантность:</b> {r['score']:.3f}\n"
         )
     return "\n".join(lines)
@@ -281,7 +285,7 @@ async def reset_confirmation_callback(update: Update, context: ContextTypes.DEFA
     
     loop = asyncio.get_event_loop()
     
-    await query.message.reply_text("🧹 Очищаю базу...")
+    await query.message.reply_text("🧹 Очищаю базу... (Может занять некоторое время)")
     await loop.run_in_executor(None, clear_database)
     
     # Также очищаем родительскую коллекцию
@@ -292,16 +296,3 @@ async def reset_confirmation_callback(update: Update, context: ContextTypes.DEFA
     
     await query.message.reply_text("✅ Сброс завершён!")
 
-
-
-
-def clear_parent_collection():
-    """Очищает коллекцию родительских документов."""
-    try:
-        client = get_chroma_client()
-        client.delete_collection("parent_documents")
-        global _parent_collection
-        _parent_collection = None
-        print("Родительская коллекция удалена.")
-    except Exception as e:
-        print(f"Ошибка при удалении родительской коллекции: {e}")
