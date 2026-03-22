@@ -65,7 +65,7 @@ def generate_answer(question: str, context_chunks: List[Dict]) -> str:
         print(f"Ошибка при обращении к Groq: {e}")
         return f"Произошла ошибка при генерации ответа: {e}"
 
-def expand_query(query: str, num_expansions: int = 2) -> list[str]:
+def expand_query(query: str, num_expansions: int = 5) -> list[str]:
     """
     Генерирует альтернативные формулировки запроса с помощью Groq.
     Возвращает список, включающий исходный запрос.

@@ -2,7 +2,7 @@ import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes, CallbackQueryHandler
 from bot.config import BOT_TOKEN # type: ignore
-from core.vector_store import search, add_chunks # type: ignore
+from core.vector_store import search_with_parents, expanded_search # type: ignore
 from bot.handlers import ( # type: ignore
     start, help_command, search_command,
     addbook_start, addbook_receive_file, addbook_cancel,
@@ -58,7 +58,7 @@ def main():
         await update.message.chat.send_action(action="typing")
         # Выполняем поиск
         loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(None, search, query, 5)
+        results = await loop.run_in_executor(None, expanded_search, query, 5)
 
         if not results:
             await update.message.reply_text("Ничего не найдено.")

@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes, ConversationHandler
 from core.vector_store import ( # type: ignore
     hybrid_search, get_all_books, delete_book, add_chunks,
     add_book_with_parents, clear_database, load_standard_books,
-    expanded_search, search_with_parents
+    expanded_search, search_with_parents, get_chroma_client
 )  
 from core.text_processor import process_book # type: ignore
 from core.llm_client import generate_answer  # type: ignore # в начало файла
@@ -70,24 +70,62 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Форматируем результат (уже без ограничения на длину текста)
-    response = f"🔍 <b>Найдено {len(results)} фрагментов:</b>\n\n"
-    for i, r in enumerate(results, 1):
-        response += f"<b>{i}. Книга:</b> {r['book_id']}\n"
-        response += f"<b>Глава:</b> {r['chapter']}\n"
-        response += f"<b>Фрагмент:</b>\n<pre>{r['text'][:500]}...</pre>\n\n"
-    
+    response = format_search_results(results)
     await update.message.reply_text(response, parse_mode="HTML")
+
+
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    question = ' '.join(context.args)
+    if not question:
+        await update.message.reply_text("Пожалуйста, укажите вопрос после /ask")
+        return
+
+    await update.message.reply_text(f"Ищу информацию по вопросу: «{question}»...")
+    
+    # Ищем релевантные чанки
+    loop = asyncio.get_event_loop()
+
+      # Проверяем наличие книг
+    books = await loop.run_in_executor(None, get_all_books)
+    if not books:
+        await update.message.reply_text(
+            "📭 В базе пока нет ни одной книги.\n"
+            "Загрузите книгу через /addbook, чтобы я мог отвечать на вопросы."
+        )
+        return
+
+    results = await loop.run_in_executor(None, expanded_search, question, 15)
+
+    if not results:
+        await update.message.reply_text("Я не нашёл в книгах информации, которая могла бы помочь ответить на этот вопрос.")
+        return
+
+    # Генерируем ответ
+    await update.message.reply_text("Нашёл несколько фрагментов. Формирую ответ...")
+    try:
+        answer = await loop.run_in_executor(None, generate_answer, question, results)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка при генерации ответа: {e}")
+        return
+
+    # Формируем итоговое сообщение
+    answer = await loop.run_in_executor(None, generate_answer, question, results)
+    response = format_answer_with_sources(answer, results)
+    await update.message.reply_text(response, parse_mode="HTML")
+
+
+
+
 def format_search_results(results: List[Dict]) -> str:
-    """Форматирует список результатов поиска в читаемый вид с HTML."""
     if not results:
         return "Ничего не найдено."
-
     lines = [f"🔍 <b>Найдено {len(results)} фрагментов:</b>\n"]
     for i, r in enumerate(results, 1):
         lines.append(
             f"<b>{i}. Книга:</b> {r['book_id']}\n"
-            f"<b>Фрагмент:</b>\n<blockquote>{r['text'][:300]}...</blockquote>\n"
-            f"<b>Релевантность:</b> {r['score']:.2f}\n"
+            f"<b>Глава:</b> {r.get('chapter', '—')}\n"
+            f"<b>Фрагмент:</b>\n<blockquote>{r['text'][:500]}...</blockquote>\n"
+            f"<b>Релевантность:</b> {r['score']:.3f}\n"
         )
     return "\n".join(lines)
 
@@ -97,10 +135,15 @@ def format_answer_with_sources(answer: str, results: List[Dict]) -> str:
     lines.append("\n📚 <b>Источники:</b>")
     for i, r in enumerate(results, 1):
         lines.append(
-            f"\n{i}. <b>{r['book_id']}</b>"
-            f"<blockquote>{r['text'][:200]}...</blockquote>"
+            f"<b>{i}. Книга:</b> {r['book_id']}\n"
+            f"<b>Глава:</b> {r.get('chapter', '—')}\n"
+            f"<b>Фрагмент:</b>\n<blockquote>{r['text'][:500]}...</blockquote>\n"
+            f"<b>Релевантность:</b> {r['score']:.3f}\n"
         )
     return "\n".join(lines)
+
+
+
 
 # --- Загрузка книги ---
 
@@ -144,52 +187,14 @@ async def addbook_receive_file(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return ConversationHandler.END
 
-    return ConversationHandler.END
 
 async def addbook_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отмена загрузки"""
     await update.message.reply_text("Загрузка отменена.")
     return ConversationHandler.END
 
-async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    question = ' '.join(context.args)
-    if not question:
-        await update.message.reply_text("Пожалуйста, укажите вопрос после /ask")
-        return
 
-    await update.message.reply_text(f"Ищу информацию по вопросу: «{question}»...")
 
-    
-    # Ищем релевантные чанки
-    loop = asyncio.get_event_loop()
-
-      # Проверяем наличие книг
-    books = await loop.run_in_executor(None, get_all_books)
-    if not books:
-        await update.message.reply_text(
-            "📭 В базе пока нет ни одной книги.\n"
-            "Загрузите книгу через /addbook, чтобы я мог отвечать на вопросы."
-        )
-        return
-
-    results = await loop.run_in_executor(None, expanded_search, 15)
-
-    if not results:
-        await update.message.reply_text("Я не нашёл в книгах информации, которая могла бы помочь ответить на этот вопрос.")
-        return
-
-    # Генерируем ответ
-    await update.message.reply_text("Нашёл несколько фрагментов. Формирую ответ...")
-    try:
-        answer = await loop.run_in_executor(None, generate_answer, question, results)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка при генерации ответа: {e}")
-        return
-
-    # Формируем итоговое сообщение
-    answer = await loop.run_in_executor(None, generate_answer, question, results)
-    response = format_answer_with_sources(answer, results)
-    await update.message.reply_text(response, parse_mode="HTML")
 
 async def listbooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отправляет пользователю список загруженных книг."""
@@ -211,6 +216,9 @@ async def listbooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response += "\n".join(f"• {book}" for book in book_list)
     
     await update.message.reply_text(response, parse_mode="HTML")
+
+
+
 
 async def cleardb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Запрашивает подтверждение очистки базы данных."""
@@ -244,50 +252,56 @@ async def clear_confirmation_callback(update: Update, context: ContextTypes.DEFA
         except Exception as e:
             await query.message.reply_text(f"❌ Ошибка при очистке: {e}")
 
+
+
+
+
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрашивает подтверждение сброса к стандартным книгам."""
+    """Сброс к стандартным книгам."""
     keyboard = [
         [InlineKeyboardButton("✅ Да, сбросить", callback_data="confirm_reset")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_reset")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "⚠️ Вы уверены, что хотите сбросить базу к стандартным книгам?\n"
-        "Все текущие загруженные книги будут удалены, а из папки `standard_books` загрузятся стандартные.",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+        "⚠️ Вы уверены, что хотите сбросить базу?\n"
+        "Все текущие книги будут удалены, загрузятся стандартные.",
+        reply_markup=reply_markup
     )
 
 async def reset_confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает подтверждение или отмену сброса."""
     query = update.callback_query
     await query.answer()
-
+    
     if query.data == "cancel_reset":
         await query.edit_message_text("❌ Сброс отменён.")
         return
+    
+    await query.edit_message_text("🔄 Начинаю сброс...")
+    
+    loop = asyncio.get_event_loop()
+    
+    await query.message.reply_text("🧹 Очищаю базу...")
+    await loop.run_in_executor(None, clear_database)
+    
+    # Также очищаем родительскую коллекцию
+    await loop.run_in_executor(None, clear_parent_collection)
+    
+    await query.message.reply_text("📚 Загружаю стандартные книги...")
+    await loop.run_in_executor(None, load_standard_books)
+    
+    await query.message.reply_text("✅ Сброс завершён!")
 
-    if query.data == "confirm_reset":
-        # Сообщаем о начале
-        await query.edit_message_text("🔄 Начинаю сброс базы данных к стандартным книгам...")
 
-        loop = asyncio.get_event_loop()
 
-        # Этап 1: Очистка базы
-        await query.message.reply_text("🧹 Очищаю текущую базу данных...")
-        try:
-            await loop.run_in_executor(None, clear_database)
-        except Exception as e:
-            await query.message.reply_text(f"❌ Ошибка при очистке базы: {e}")
-            return
 
-        # Этап 2: Загрузка стандартных книг
-        await query.message.reply_text("📚 Загружаю стандартные книги из папки standard_books...")
-        try:
-            await loop.run_in_executor(None, load_standard_books)
-        except Exception as e:
-            await query.message.reply_text(f"❌ Ошибка при загрузке книг: {e}")
-            return
-
-        # Финальное сообщение
-        await query.message.reply_text("✅ Сброс завершён! Теперь доступны стандартные книги.")
+def clear_parent_collection():
+    """Очищает коллекцию родительских документов."""
+    try:
+        client = get_chroma_client()
+        client.delete_collection("parent_documents")
+        global _parent_collection
+        _parent_collection = None
+        print("Родительская коллекция удалена.")
+    except Exception as e:
+        print(f"Ошибка при удалении родительской коллекции: {e}")
