@@ -22,7 +22,10 @@ _bm25_chunks = []   # список словарей с полными данны
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Лёгкая и быстрая модель
 CHROMA_PERSIST_DIR = "./chroma_data"   # Папка для хранения базы данных
 COLLECTION_NAME = "books"               # Имя коллекции
-MIN_SCORE = 0.1                     # Минимальный порог для включения в результаты поиска
+MIN_SEARCH_SCORE = 0.5
+MIN_HYBRID_SEARCH_SCORE = 0.33
+MIN_EXPANDED_SEARCH_SCORE = 0.1
+MIN_SEARCH_WITH_PARENTS_SCORE = 0.1
 # Глобальные объекты
 _model = None
 _chroma_client = None
@@ -118,12 +121,8 @@ def add_child_chunks(chunks: List[Dict]):
         })
         documents.append(chunk['text'])
     
-    collection.add(
-        ids=ids,
-        embeddings=embeddings,
-        metadatas=metadatas,
-        documents=documents
-    )
+    # Пакетное добавление
+    add_in_batches(collection, ids, embeddings, metadatas, documents)
 
 def add_parent_documents(parents: List[Dict]):
     """Добавляет родительские документы для возврата."""
@@ -141,13 +140,8 @@ def add_parent_documents(parents: List[Dict]):
     } for p in parents]
     documents = [p['text'] for p in parents]
     
-    collection.add(
-        ids=ids,
-        embeddings=embeddings,
-        metadatas=metadatas,
-        documents=documents
-    )
-
+    # Пакетное добавление
+    add_in_batches(collection, ids, embeddings, metadatas, documents)
 
 def add_chunks(chunks: List[Dict]):
     """Добавляет список чанков в векторную базу."""
@@ -183,16 +177,23 @@ def add_chunks(chunks: List[Dict]):
         documents.append(chunk['text'])
 
     # Добавляем в коллекцию
-    collection.add(
-        ids=ids,
-        embeddings=embeddings,
-        metadatas=metadatas,
-        documents=documents
-    )
+    add_in_batches(collection, ids, embeddings, metadatas, documents)
     print(f"Добавлено {len(chunks)} чанков в коллекцию.")
     all_chunks = get_all_chunks()
     build_bm25_index(all_chunks)
 
+def add_in_batches(collection, ids, embeddings, metadatas, documents, batch_size=1000):
+    """Добавляет записи в коллекцию порциями, чтобы не превысить лимит."""
+    total = len(ids)
+    for i in range(0, total, batch_size):
+        end = min(i + batch_size, total)
+        collection.add(
+            ids=ids[i:end],
+            embeddings=embeddings[i:end],
+            metadatas=metadatas[i:end],
+            documents=documents[i:end]
+        )
+        print(f"Добавлено {end - i} записей (всего {end}/{total})")
 
 def get_all_books() -> list[str]:
     """Возвращает списоr книг, присутствующих в векторной базе."""
@@ -254,19 +255,24 @@ def search(query: str, n_results: int = 5) -> List[Dict]:
     output = []
     if results['ids'] and results['ids'][0]:
         for i in range(len(results['ids'][0])):
+
             distance = results['distances'][0][i]
             score = 1 - distance
-            meta = results['metadatas'][0][i]
-            item = {
-                'book_id': meta['book_id'],
-                'chunk_index': meta['chunk_index'],
-                'text': results['documents'][0][i],
-                'score': score
-            }
-            # Если есть parent_id, добавляем
-            if 'parent_id' in meta:
-                item['parent_id'] = meta['parent_id']
-            output.append(item)
+            if score >= MIN_SEARCH_SCORE:
+                meta = results['metadatas'][0][i]
+                item = {
+                    'book_id': meta['book_id'],
+                    'chunk_index': meta['chunk_index'],
+                    'text': results['documents'][0][i],
+                    'score': score
+                }
+                # Если есть parent_id, добавляем
+                if 'parent_id' in meta:
+                    item['parent_id'] = meta['parent_id']
+                output.append(item)
+            else:
+                break
+            
     return output
 
 
@@ -309,7 +315,7 @@ def hybrid_search(query: str, n_results: int = 5, alpha: float = 0.5) -> List[Di
     hybrid_list = []
     for key, scores in combined.items():
         hybrid_score = alpha * scores['vector'] + (1 - alpha) * scores['bm25']
-        if hybrid_score >= MIN_SCORE:
+        if hybrid_score >= MIN_HYBRID_SEARCH_SCORE:
             item = scores['data'].copy()
             item['score'] = hybrid_score
             hybrid_list.append(item)
@@ -375,13 +381,16 @@ def search_with_parents(query: str, n_results: int = 5) -> List[Dict]:
         pid = parent_results['ids'][i]
         scores = parent_scores.get(pid, [0.0])
         agg_score = sum(scores)/len(scores) # среднее арифметическое
-        output.append({
-            'book_id': parent_results['metadatas'][i]['book_id'],
-            'chapter': parent_results['metadatas'][i]['chapter'],
-            'parent_id': pid,
-            'text': parent_results['documents'][i],
-            'score': agg_score
-        })
+        if agg_score >= MIN_SEARCH_WITH_PARENTS_SCORE:
+            output.append({
+                'book_id': parent_results['metadatas'][i]['book_id'],
+                'chapter': parent_results['metadatas'][i]['chapter'],
+                'parent_id': pid,
+                'text': parent_results['documents'][i],
+                'score': agg_score
+            })
+        else:
+            continue
 
     # Сортируем по убыванию оценки
     output.sort(key=lambda x: x['score'], reverse=True)

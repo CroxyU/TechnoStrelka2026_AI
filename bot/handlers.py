@@ -171,7 +171,8 @@ async def addbook_receive_file(update: Update, context: ContextTypes.DEFAULT_TYP
     
     file_path = os.path.join("books", file.file_name)
     os.makedirs("books", exist_ok=True)
-    await file.get_file().download_to_drive(file_path)
+    file_obj = await file.get_file()
+    await file_obj.download_to_drive(file_path)
     
     loop = asyncio.get_event_loop()
     try:
