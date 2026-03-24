@@ -5,8 +5,11 @@ import chromadb
 from chromadb.config import Settings
 from tqdm import tqdm
 from typing import List, Dict, Optional
-from rank_bm25 import BM25Okapi
+from rank_bm25 import BM25Okapi # type: ignore
 from nltk.tokenize import word_tokenize
+from sentence_transformers import CrossEncoder
+
+
 import nltk
 from core.text_processor import process_book_with_parents, process_book # type: ignore
 from core.llm_client import expand_query # type: ignore
@@ -18,19 +21,27 @@ except LookupError:
 # Глобальные переменные для BM25
 _bm25_index = None
 _bm25_chunks = []   # список словарей с полными данными 
+_cross_encoder = None
 # Константы
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Лёгкая и быстрая модель
+EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 CHROMA_PERSIST_DIR = "./chroma_data"   # Папка для хранения базы данных
 COLLECTION_NAME = "books"               # Имя коллекции
-MIN_SEARCH_SCORE = 0.5
-MIN_HYBRID_SEARCH_SCORE = 0.33
-MIN_EXPANDED_SEARCH_SCORE = 0.1
-MIN_SEARCH_WITH_PARENTS_SCORE = 0.1
+MIN_HYBRID_SEARCH_SCORE = 0.3           # Минимальный порог для включения в результаты гибридного поиска
+MIN_RERANK_SCORE = 6.5                  # Минимальный порог для переранкирования
 # Глобальные объекты
 _model = None
 _chroma_client = None
 _collection = None
 _parent_collection = None
+
+def encode_query(model, query: str) -> list:
+    """Кодирует запрос с префиксом 'query: '"""
+    return model.encode("query: " + query).tolist()
+
+def encode_passages(model, texts: list[str], show_progress: bool = True) -> list:
+    """Кодирует тексты с префиксом 'passage: '"""
+    prefixed = ["passage: " + t for t in texts]
+    return model.encode(prefixed, show_progress_bar=show_progress).tolist()
 
 def build_bm25_index(chunks: List[Dict]):
     """
@@ -51,6 +62,14 @@ def get_embedding_model():
         print(f"Загружаем модель эмбеддингов: {EMBEDDING_MODEL}")
         _model = SentenceTransformer(EMBEDDING_MODEL)
     return _model
+
+def get_dynamic_alpha(vector_results: List[Dict], bm25_results: List[Dict]) -> float:
+    if not vector_results and not bm25_results:
+        return 0.5
+    var_vec = np.var([r['score'] for r in vector_results]) if vector_results else 0
+    var_bm25 = np.var([r['score'] for r in bm25_results]) if bm25_results else 0
+    total = var_vec + var_bm25
+    return var_vec / total if total > 0 else 0.5
 
 def get_chroma_client():
     """Возвращает клиент ChromaDB."""
@@ -84,6 +103,15 @@ def get_parent_collection():
         )
     return _parent_collection
 
+def get_cross_encoder():
+    global _cross_encoder
+    if _cross_encoder is None:
+        # Используем более мощную модель для лучшего качества
+        print("Загружаем кросс-энкодер...")
+        _cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-12-v2')
+    return _cross_encoder
+
+
 def add_book_with_parents(filepath: str, book_id: str):
     """
     Добавляет книгу в базу с иерархической структурой.
@@ -104,7 +132,7 @@ def add_child_chunks(chunks: List[Dict]):
     collection = get_chroma_collection()
     
     texts = [chunk['text'] for chunk in chunks]
-    embeddings = model.encode(texts, show_progress_bar=True).tolist()
+    embeddings = encode_passages(model, texts, show_progress=True)
     
     ids = []
     metadatas = []
@@ -130,7 +158,7 @@ def add_parent_documents(parents: List[Dict]):
     collection = get_parent_collection()
     
     texts = [p['text'] for p in parents]
-    embeddings = model.encode(texts, show_progress_bar=True).tolist()
+    embeddings = encode_passages(model, texts, show_progress=True)
     
     ids = [p['parent_id'] for p in parents]
     metadatas = [{
@@ -162,7 +190,7 @@ def add_chunks(chunks: List[Dict]):
 
     # Генерируем эмбеддинги пачкой
     print("Генерация эмбеддингов...")
-    embeddings_list = model.encode(texts, show_progress_bar=True).tolist()
+    embeddings_list = encode_passages(model, texts, show_progress=True)
 
     for idx, chunk in enumerate(tqdm(chunks, desc="Подготовка данных")):
         # Уникальный ID: book_id + _ + chunk_index
@@ -245,7 +273,7 @@ def search(query: str, n_results: int = 5) -> List[Dict]:
     model = get_embedding_model()
     collection = get_chroma_collection()
 
-    query_emb = model.encode(query).tolist()
+    query_emb = encode_query(model, query)
     results = collection.query(
         query_embeddings=[query_emb],
         n_results=n_results,
@@ -258,25 +286,22 @@ def search(query: str, n_results: int = 5) -> List[Dict]:
 
             distance = results['distances'][0][i]
             score = 1 - distance
-            if score >= MIN_SEARCH_SCORE:
-                meta = results['metadatas'][0][i]
-                item = {
-                    'book_id': meta['book_id'],
-                    'chunk_index': meta['chunk_index'],
-                    'text': results['documents'][0][i],
-                    'score': score
-                }
-                # Если есть parent_id, добавляем
-                if 'parent_id' in meta:
-                    item['parent_id'] = meta['parent_id']
-                output.append(item)
-            else:
-                break
+            meta = results['metadatas'][0][i]
+            item = {
+                'book_id': meta['book_id'],
+                'chunk_index': meta['chunk_index'],
+                'text': results['documents'][0][i],
+                'score': score
+            }
+            # Если есть parent_id, добавляем
+            if 'parent_id' in meta:
+                item['parent_id'] = meta['parent_id']
+            output.append(item)
             
     return output
 
 
-def hybrid_search(query: str, n_results: int = 5, alpha: float = 0.5) -> List[Dict]:
+def hybrid_search(query: str, n_results: int = 5, alpha: float = None) -> List[Dict]:
     """
     Гибридный поиск: объединяет векторный поиск и BM25.
     """
@@ -298,6 +323,7 @@ def hybrid_search(query: str, n_results: int = 5, alpha: float = 0.5) -> List[Di
             chunk['score'] = scores[idx] / max_score
             bm25_results.append(chunk)
 
+
     # 3. Объединяем результаты
     combined = {}
     # Добавляем векторные результаты
@@ -311,6 +337,10 @@ def hybrid_search(query: str, n_results: int = 5, alpha: float = 0.5) -> List[Di
             combined[key]['bm25'] = r['score']
         else:
             combined[key] = {'vector': 0.0, 'bm25': r['score'], 'data': r}
+
+    if alpha is None:
+        alpha = get_dynamic_alpha(vector_results, bm25_results)
+    
 
     hybrid_list = []
     for key, scores in combined.items():
@@ -335,7 +365,7 @@ def expanded_search(query: str, n_results: int = 5) -> List[Dict]:
     # Собираем результаты для каждого запроса
     all_results = []
     for q in queries:
-        results = hybrid_search(q, n_results=n_results * 2)  # берём с запасом
+        results = hybrid_search(q, n_results=n_results * 3)  # берём с запасом
         all_results.extend(results)
 
     # Убираем дубликаты по ID чанка (book_id + chunk_index)
@@ -351,7 +381,7 @@ def expanded_search(query: str, n_results: int = 5) -> List[Dict]:
 
 def search_with_parents(query: str, n_results: int = 5) -> List[Dict]:
     # 1. Ищем по дочерним чанкам
-    child_results = expanded_search(query, n_results=n_results * 2)
+    child_results = expanded_search(query, n_results=n_results * 4)
 
     if not child_results:
         return []
@@ -374,27 +404,56 @@ def search_with_parents(query: str, n_results: int = 5) -> List[Dict]:
         ids=parent_ids,
         include=["documents", "metadatas"]
     )
-
-    # 5. Формируем результат с агрегированной оценкой (max или average)
-    output = []
+    unique_output = {}
     for i in range(len(parent_results['ids'])):
         pid = parent_results['ids'][i]
+        text = parent_results['documents'][i]
+        meta = parent_results['metadatas'][i]
+        key = (meta['book_id'], text)   # ключ из книги и текста
         scores = parent_scores.get(pid, [0.0])
-        agg_score = sum(scores)/len(scores) # среднее арифметическое
-        if agg_score >= MIN_SEARCH_WITH_PARENTS_SCORE:
-            output.append({
-                'book_id': parent_results['metadatas'][i]['book_id'],
-                'chapter': parent_results['metadatas'][i]['chapter'],
-                'parent_id': pid,
-                'text': parent_results['documents'][i],
-                'score': agg_score
-            })
-        else:
-            continue
+        agg_score = sum(scores) / len(scores) if scores else 0.0
 
-    # Сортируем по убыванию оценки
-    output.sort(key=lambda x: x['score'], reverse=True)
+        if key not in unique_output or agg_score > unique_output[key]['score']:
+            unique_output[key] = {
+                'book_id': meta['book_id'],
+                'chapter': meta['chapter'],
+                'parent_id': pid,
+                'text': text,
+                'score': agg_score
+            }
+
+    output = list(unique_output.values())
+    if output:
+        output = rerank(query, output, top_k=n_results)
     return output[:n_results]
+
+
+
+def rerank(query: str, candidates: List[Dict], top_k: int = 5) -> List[Dict]:
+    if not candidates:
+        return []
+    encoder = get_cross_encoder()
+    pairs = [[query, c['text']] for c in candidates]
+    raw_scores = encoder.predict(pairs)
+    print(raw_scores.max())
+    filtered_indices = [i for i, s in enumerate(raw_scores) if s >= MIN_RERANK_SCORE]
+    if not filtered_indices:
+        return []
+
+    # Берём только прошедших фильтр
+    candidates = [candidates[i] for i in filtered_indices]
+    raw_scores = raw_scores[filtered_indices]
+    raw_scores = np.array(raw_scores)    
+    min_score = raw_scores.min()
+    max_score = raw_scores.max()
+    if max_score - min_score > 0:
+        normalized_scores = (raw_scores - min_score) / (max_score - min_score)
+    else:
+        normalized_scores = np.ones_like(raw_scores)  # все оценки равны
+    for i, c in enumerate(candidates):
+        c['score'] = float(normalized_scores[i])   # перезаписываем score
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+    return candidates[:top_k]
 
 
 
