@@ -54,9 +54,10 @@ Telegram-бот для умного поиска по книгам с испол
 1. **Клонировать репозиторий**
    
    `git clone https://github.com/CroxyU/TechnoStrelka2026_AI.git`
+   
    `cd TechnoStrelka2026_AI`
 
-2. **Создать и активировать виртуальное окружение**
+3. **Создать и активировать виртуальное окружение**
 `python -m venv .venv`
 
 - Windows (Git Bash): `source .venv/Scripts/activate`
@@ -68,10 +69,12 @@ Telegram-бот для умного поиска по книгам с испол
 
 4. **Настроить переменные окружения**  
 Создайте файл `.env` в корне проекта и добавьте:
-BOT_TOKEN=ваш_токен_бота
-GROQ_API_KEY=ваш_ключ_groq
 
-5. **Запустить бота**
+BOT_TOKEN=ваш_токен_бота
+
+API_KEY=ваш_ключ_groq
+
+6. **Запустить бота**
 python -m bot.main
 
 ---
