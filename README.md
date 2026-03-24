@@ -53,8 +53,8 @@ Telegram-бот для умного поиска по книгам с испол
 
 1. **Клонировать репозиторий**
    
--`git clone https://github.com/CroxyU/TechnoStrelka2026_AI.git`
--`cd TechnoStrelka2026_AI`
+   `git clone https://github.com/CroxyU/TechnoStrelka2026_AI.git`
+   `cd TechnoStrelka2026_AI`
 
 2. **Создать и активировать виртуальное окружение**
 `python -m venv .venv`
