@@ -52,18 +52,19 @@ Telegram-бот для умного поиска по книгам с испол
 На компьютере должен присутствовать Python
 
 1. **Клонировать репозиторий**
-git clone https://github.com/CroxyU/TechnoStrelka2026_AI.git
-cd TechnoStrelka2026_AI
+   
+-`git clone https://github.com/CroxyU/TechnoStrelka2026_AI.git`
+-`cd TechnoStrelka2026_AI`
 
 2. **Создать и активировать виртуальное окружение**
-python -m venv .venv
+`python -m venv .venv`
 
 - Windows (Git Bash): `source .venv/Scripts/activate`
 - Windows (cmd): `.venv\Scripts\activate`
 - Linux/macOS: `source .venv/bin/activate`
 
 3. **Установить зависимости**
-pip install -r requirements.txt
+`pip install -r requirements.txt`
 
 4. **Настроить переменные окружения**  
 Создайте файл `.env` в корне проекта и добавьте:
