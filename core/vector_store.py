@@ -210,7 +210,7 @@ def add_chunks(chunks: List[Dict]):
     all_chunks = get_all_chunks()
     build_bm25_index(all_chunks)
 
-def add_in_batches(collection, ids, embeddings, metadatas, documents, batch_size=1000):
+def add_in_batches(collection, ids, embeddings, metadatas, documents, batch_size=4000):
     """Добавляет записи в коллекцию порциями, чтобы не превысить лимит."""
     total = len(ids)
     for i in range(0, total, batch_size):
